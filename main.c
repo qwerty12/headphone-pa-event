@@ -36,8 +36,11 @@ static gboolean headphones = FALSE;
 
 static gboolean pulseeffects_running()
 {
+	static GDBusProxy *dbus_proxy = NULL;
+	if (!dbus_proxy)
+		dbus_proxy = g_dbus_proxy_new_for_bus_sync(G_BUS_TYPE_SESSION, G_DBUS_PROXY_FLAGS_DO_NOT_LOAD_PROPERTIES | G_DBUS_PROXY_FLAGS_DO_NOT_CONNECT_SIGNALS, NULL, "org.freedesktop.DBus", "/", "org.freedesktop.DBus", NULL, NULL);
+
 	gboolean ret = FALSE;
-	g_autoptr(GDBusProxy) dbus_proxy = g_dbus_proxy_new_for_bus_sync(G_BUS_TYPE_SESSION, G_DBUS_PROXY_FLAGS_DO_NOT_LOAD_PROPERTIES | G_DBUS_PROXY_FLAGS_DO_NOT_CONNECT_SIGNALS, NULL, "org.freedesktop.DBus", "/", "org.freedesktop.DBus", NULL, NULL);
 	g_autoptr(GVariant) res = NULL;
 	if (dbus_proxy)
 		if ((res = g_dbus_proxy_call_sync(dbus_proxy, "NameHasOwner", g_variant_new("(s)", "com.github.wwmm.pulseeffects"), G_DBUS_CALL_FLAGS_NONE, -1, NULL, NULL)))
@@ -78,12 +81,12 @@ static void child_setup(gpointer user_data G_GNUC_UNUSED) { setsid(); }
 
 static void pa_sink_info_set_vol_cb(pa_context* context, const pa_sink_info* i, int eol, void* userdata G_GNUC_UNUSED)
 {
+	static const pa_volume_t newvol = PA_VOLUME_NORM * 40 / 100;
 	pa_cvolume vol;
 
 	if (eol)
 		return;
 
-	const pa_volume_t newvol = (PA_VOLUME_NORM * 10 / 100) * 4;
 	if (newvol > pa_cvolume_avg(&i->volume))
 		return;
 
@@ -108,10 +111,11 @@ static int getWindowName(Display *disp, Window w, char *buf, size_t buflen)
 
 static gboolean is_mpv_main_window(Display *disp, const Window w)
 {
+	char name[256];
+
 	if (!w || !disp)
 		return FALSE;
 
-	char name[256];
 	return getWindowName(disp, w, name, sizeof(name)) && g_str_has_suffix(name, " - mpv");
 }
 
@@ -159,11 +163,12 @@ static void headphones_unplugged(pa_card_info const* card)
 	headphones = FALSE;
 
 	card_idx = card->index;
+	pa_operation_unref(pa_context_get_sink_info_list(pa_ctx, pa_sink_info_by_card_cb, NULL));
+
 	if (pulseeffects_running()) {
 		gchar *argv[] = { "/usr/bin/pulseeffects", "-q", NULL };
 		g_spawn_async(NULL, argv, NULL, G_SPAWN_DEFAULT, NULL, NULL, NULL, NULL);
 	}
-	pa_operation_unref(pa_context_get_sink_info_list(pa_ctx, pa_sink_info_by_card_cb, NULL));
 }
 
 static void headphones_plugged(pa_card_info const* card G_GNUC_UNUSED)
@@ -189,22 +194,23 @@ static void pa_get_card_info_callback(pa_context *context, pa_card_info const* c
 		return;
 	}
 
-	if(is_last)
+	if (is_last)
 		return;
 
-	if (card->ports) {
-		for (pa_card_port_info **p = card->ports; *p; ++p) {
-			if (!g_strcmp0((*p)->name, "analog-output-headphones")) {
-				switch((*p)->available) {
-					case PA_PORT_AVAILABLE_YES:
-						headphones_plugged(card);
-						break;
-					case PA_PORT_AVAILABLE_NO:
-						headphones_unplugged(card);
-						break;
-					default:
-						break;
-				}
+	if (!card->ports)
+		return;
+
+	for (pa_card_port_info **p = card->ports; *p; ++p) {
+		if (!g_strcmp0((*p)->name, "analog-output-headphones")) {
+			switch((*p)->available) {
+				case PA_PORT_AVAILABLE_YES:
+					headphones_plugged(card);
+					break;
+				case PA_PORT_AVAILABLE_NO:
+					headphones_unplugged(card);
+					break;
+				default:
+					break;
 			}
 		}
 	}
@@ -219,12 +225,11 @@ static void pa_context_subscribe_callback(pa_context *context, pa_subscription_e
 static void pa_sink_info_get_headphone_current_state_cb(pa_context *ctx, const pa_sink_info *i, int eol, void *userdata G_GNUC_UNUSED)
 {
 	/* TODO: Look at default sink only. Maybe. Getting an enema from a bicycle pump is honestly more preferable to using the PA API. */
-    if (eol)
-        return;
+	if (eol)
+		return;
 
-    if (i->card != PA_INVALID_INDEX)
-		if (!g_strcmp0(i->active_port->name, "analog-output-headphones") && i->active_port->available == PA_PORT_AVAILABLE_YES)
-			headphones_plugged(NULL);
+	if (i->card != PA_INVALID_INDEX && i->active_port->available == PA_PORT_AVAILABLE_YES && !g_strcmp0(i->active_port->name, "analog-output-headphones"))
+		headphones_plugged(NULL);
 }
 
 static void pa_context_state_callback(pa_context *context, void *userdata G_GNUC_UNUSED)
@@ -243,8 +248,7 @@ static void init_pulse()
 
 	if ((pa_ctx = pa_context_new(pa_glib_mainloop_get_api(pa_loop), "headphone-pa-event"))) {
 		pa_context_set_state_callback(pa_ctx, pa_context_state_callback, NULL);
-		if (pa_context_connect(pa_ctx, NULL, PA_CONTEXT_NOAUTOSPAWN, NULL) < 0)
-			fail_log(pa_ctx, "pa_context_connect");
+		pa_context_connect(pa_ctx, NULL, PA_CONTEXT_NOAUTOSPAWN | PA_CONTEXT_NOFAIL, NULL);
 	} else {
 		fail_log(NULL, "pa_context_new");
 	}
@@ -254,21 +258,19 @@ static void init_x11()
 {
 	if ((disp = XOpenDisplay(NULL))) {
 		unsigned long nwin;
-		int scr = DefaultScreen(disp);
-		Window root = RootWindow(disp, scr);
 
 		XSetErrorHandler(xerrhandler);
 
 		Window *win = get_client_list(disp, &nwin);
 		if (win) {
-			for (int i = 0; i < nwin / sizeof(Window); ++i) {
+			for (unsigned long i = 0; i < nwin / sizeof(Window); ++i) {
 				if (is_mpv_main_window(disp, win[i]))
 					number_list = g_slist_prepend(number_list, GINT_TO_POINTER(win[i]));
 			}
 			g_free(win);
 		}
 
-		XSelectInput(disp, root, SubstructureNotifyMask);
+		XSelectInput(disp, RootWindow(disp, DefaultScreen(disp)), SubstructureNotifyMask);
 		gxsource = X11EventSourceGlib(disp, x11_event_cb, NULL, NULL);
 	}
 }
