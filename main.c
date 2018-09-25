@@ -216,7 +216,7 @@ static void pa_sink_info_get_headphone_current_state_cb(pa_context *ctx, const p
         return;
 
     if (i->card != PA_INVALID_INDEX)
-		if (!g_strcmp0(i->active_port->name, "analog-output-headphones"))
+		if (!g_strcmp0(i->active_port->name, "analog-output-headphones") && i->active_port->available == PA_PORT_AVAILABLE_YES)
 			headphones_plugged(NULL);
 }
 
