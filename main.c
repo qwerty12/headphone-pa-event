@@ -97,12 +97,21 @@ static void pa_server_info_callback(pa_context *context, const pa_server_info *i
 		pa_operation_unref(pa_context_get_sink_info_by_name(context, i->default_sink_name, pa_sink_info_set_vol_cb, NULL));
 }
 
-int xerrhandler(Display *d G_GNUC_UNUSED, XErrorEvent *e G_GNUC_UNUSED) { return 0; }
+static int xerrhandler(Display *d G_GNUC_UNUSED, XErrorEvent *e G_GNUC_UNUSED) { return 0; }
 
-int getWindowName(Display *disp, Window w, char *buf, size_t buflen)
+static int getWindowName(Display *disp, Window w, char *buf, size_t buflen)
 {
 	XTextProperty prop;
 	return XGetTextProperty(disp, w, &prop, XA_WM_NAME) ? snprintf(buf, buflen, "%s", prop.value) : 0;
+}
+
+static gboolean is_mpv_main_window(Display *disp, const Window w)
+{
+	if (!w || !disp)
+		return FALSE;
+
+	char name[256];
+	return getWindowName(disp, w, name, sizeof(name)) && g_str_has_suffix(name, " - mpv");
 }
 
 static gboolean x11_event_cb(const XEvent *event, gpointer user_data G_GNUC_UNUSED)
@@ -112,9 +121,8 @@ static gboolean x11_event_cb(const XEvent *event, gpointer user_data G_GNUC_UNUS
 	switch (event->type) {
 		case MapNotify:
 		{
-			char name[256];
 			XMapEvent *mev = (XMapEvent *)event;
-			if (getWindowName(disp, mev->window, name, sizeof(name)) && g_str_has_suffix(name, " - mpv")) {
+			if (is_mpv_main_window(disp, mev->window)) {
 				number_list = g_slist_prepend(number_list, GINT_TO_POINTER(mev->window));
 				if (pulse_ready && headphones && g_slist_length(number_list) == 1)
 					pa_operation_unref(pa_context_get_server_info(pa_ctx, pa_server_info_callback, NULL));
@@ -245,8 +253,7 @@ static void init_pulse()
 
 static void init_x11()
 {
-	disp = XOpenDisplay(NULL);
-	if (disp) {
+	if ((disp = XOpenDisplay(NULL))) {
 		unsigned long nwin;
 		int scr = DefaultScreen(disp);
 		Window root = RootWindow(disp, scr);
@@ -256,8 +263,7 @@ static void init_x11()
 		Window *win = get_client_list(disp, &nwin);
 		if (win) {
 			for (int i = 0; i < nwin / sizeof(Window); ++i) {
-				char name[256];
-				if (getWindowName(disp, win[i], name, sizeof(name)) && g_str_has_suffix(name, " - mpv"))
+				if (is_mpv_main_window(disp, win[i]))
 					number_list = g_slist_prepend(number_list, GINT_TO_POINTER(win[i]));
 			}
 			g_free(win);
