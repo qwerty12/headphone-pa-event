@@ -5,7 +5,7 @@
 	and https://www.tedunangst.com/flak/post/logging-the-foreground-process-in-X11
 */
 
-#include <stdio.h>
+#include <glib/gstdio.h>
 
 #include <glib-unix.h>
 #include <gio/gio.h>
@@ -23,7 +23,9 @@ static pa_context *pa_ctx = NULL;
 
 static Display *disp = NULL;
 static GLibX11Source *gxsource = NULL;
-static GSList *number_list = NULL;
+static GPtrArray *number_list = NULL;
+
+static GDBusConnection *sess_conn = NULL;
 
 static uint32_t card_idx = 0;
 
@@ -36,15 +38,15 @@ static gboolean headphones = FALSE;
 
 static gboolean pulseeffects_running()
 {
-	static GDBusProxy *dbus_proxy = NULL;
-	if (!dbus_proxy)
-		dbus_proxy = g_dbus_proxy_new_for_bus_sync(G_BUS_TYPE_SESSION, G_DBUS_PROXY_FLAGS_DO_NOT_LOAD_PROPERTIES | G_DBUS_PROXY_FLAGS_DO_NOT_CONNECT_SIGNALS, NULL, "org.freedesktop.DBus", "/", "org.freedesktop.DBus", NULL, NULL);
-
 	gboolean ret = FALSE;
-	g_autoptr(GVariant) res = NULL;
-	if (dbus_proxy)
-		if ((res = g_dbus_proxy_call_sync(dbus_proxy, "NameHasOwner", g_variant_new("(s)", "com.github.wwmm.pulseeffects"), G_DBUS_CALL_FLAGS_NONE, -1, NULL, NULL)))
+
+	if (sess_conn) {
+		g_autoptr(GVariant) res = g_dbus_connection_call_sync(sess_conn, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "NameHasOwner", g_variant_new("(s)", "com.github.wwmm.pulseeffects"), NULL, G_DBUS_CALL_FLAGS_NONE, -1, NULL, NULL);
+
+		if (res)
 			g_variant_get(res, "(b)", &ret);
+	}
+
 	return ret;
 }
 
@@ -72,8 +74,12 @@ static void cleanup()
 {
 	g_clear_pointer(&gxsource, X11EventSourceGlib_destroy);
 	g_clear_pointer(&disp, XCloseDisplay);
-	g_clear_pointer(&number_list, g_slist_free);
 	deinit_pulse();
+	if (number_list) {
+		g_ptr_array_free(number_list, TRUE);
+		number_list = NULL;
+	}
+	g_clear_object(&sess_conn);
 	g_clear_pointer(&loop, g_main_loop_unref);
 }
 
@@ -128,8 +134,8 @@ static gboolean x11_event_cb(const XEvent *event, gpointer user_data G_GNUC_UNUS
 		{
 			XMapEvent *mev = (XMapEvent *)event;
 			if (is_mpv_main_window(disp, mev->window)) {
-				number_list = g_slist_prepend(number_list, GINT_TO_POINTER(mev->window));
-				if (pulse_ready && headphones && g_slist_length(number_list) == 1)
+				g_ptr_array_add(number_list, GINT_TO_POINTER(mev->window));
+				if (pulse_ready && headphones && number_list->len == 1)
 					pa_operation_unref(pa_context_get_server_info(pa_ctx, pa_server_info_callback, NULL));
 			}
 			break;
@@ -137,8 +143,9 @@ static gboolean x11_event_cb(const XEvent *event, gpointer user_data G_GNUC_UNUS
 		case UnmapNotify:
 		{
 			XUnmapEvent *uev = (XUnmapEvent *)event;
-			if (g_slist_length(number_list))
-				number_list = g_slist_remove(number_list, GINT_TO_POINTER(uev->window));
+			if (number_list->len)
+				g_ptr_array_remove_fast(number_list, GINT_TO_POINTER(uev->window));
+			break;
 		}
 		default:
 			break;
@@ -183,7 +190,7 @@ static void headphones_plugged(pa_card_info const* card G_GNUC_UNUSED)
 		    g_error("Spawning child failed: %s", error->message);
 	}
 
-	if (g_slist_length(number_list))
+	if (number_list->len)
 		pa_operation_unref(pa_context_get_server_info(pa_ctx, pa_server_info_callback, NULL));
 }
 
@@ -265,7 +272,7 @@ static void init_x11()
 		if (win) {
 			for (unsigned long i = 0; i < nwin / sizeof(Window); ++i) {
 				if (is_mpv_main_window(disp, win[i]))
-					number_list = g_slist_prepend(number_list, GINT_TO_POINTER(win[i]));
+					g_ptr_array_add(number_list, GINT_TO_POINTER(win[i]));
 			}
 			g_free(win);
 		}
@@ -280,6 +287,9 @@ int main()
 	loop = g_main_loop_new(NULL, FALSE);
 	g_unix_signal_add(SIGINT, on_sigint, NULL);
 	g_unix_signal_add(SIGTERM, on_sigint, NULL);
+
+	number_list = g_ptr_array_sized_new(2);
+	sess_conn = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, NULL);
 
 	init_x11();
 	init_pulse();
