@@ -1,4 +1,4 @@
-// cc -Wall -O2 -s `pkg-config --cflags --libs gio-unix-2.0 libpulse-mainloop-glib x11` main.c x11_event_source_glib.c wmctrl.c -o headphone-pa-event
+// cc -Wall -O2 -s `pkg-config --cflags --libs glib-2.0 libpulse-mainloop-glib x11` main.c x11_event_source_glib.c wmctrl.c -o headphone-pa-event
 
 /*
 	Parts based on projedi's (Alexander Shabalin) https://github.com/projedi/headphone-event
@@ -8,7 +8,6 @@
 #include <glib/gstdio.h>
 
 #include <glib-unix.h>
-#include <gio/gio.h>
 
 #include <pulse/pulseaudio.h>
 #include <pulse/glib-mainloop.h>
@@ -16,8 +15,11 @@
 #include "x11_event_source_glib.h"
 #include "wmctrl.h"
 
+static GPid pe_pid = 0;
+static uint32_t card_idx = 0;
+static gboolean pulse_ready = FALSE, headphones = FALSE;
+
 static GMainLoop *loop = NULL;
-static gboolean pulse_ready = FALSE;
 static pa_glib_mainloop *pa_loop = NULL;
 static pa_context *pa_ctx = NULL;
 
@@ -25,29 +27,55 @@ static Display *disp = NULL;
 static GLibX11Source *gxsource = NULL;
 static GPtrArray *number_list = NULL;
 
-static GDBusConnection *sess_conn = NULL;
-
-static uint32_t card_idx = 0;
-
-static gboolean headphones = FALSE;
-
 #define fail_log(context, name) {\
 	g_critical(name " failed: %s", pa_strerror(pa_context_errno(context)));\
 	exit(1);\
 }
 
-static gboolean pulseeffects_running()
+static gboolean pulseeffects_start(gpointer);
+static gboolean pulseeffects_stop(gpointer);
+
+static void
+child_watch_cb (GPid     pid,
+                gint     status,
+                gpointer user_data G_GNUC_UNUSED)
 {
-	gboolean ret = FALSE;
+	if (pid == pe_pid) {
+		pe_pid = 0;
 
-	if (sess_conn) {
-		g_autoptr(GVariant) res = g_dbus_connection_call_sync(sess_conn, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "NameHasOwner", g_variant_new("(s)", "com.github.wwmm.pulseeffects"), NULL, G_DBUS_CALL_FLAGS_NONE, -1, NULL, NULL);
-
-		if (res)
-			g_variant_get(res, "(b)", &ret);
+		if (WIFSIGNALED(status) && WTERMSIG(status) == SIGSEGV)
+			g_idle_add(headphones ? pulseeffects_start : pulseeffects_stop, NULL);
 	}
 
-	return ret;
+	g_spawn_close_pid(pid);
+}
+
+static void child_setup(gpointer user_data G_GNUC_UNUSED) { setsid(); }
+
+static gboolean pulseeffects_start(gpointer user_data G_GNUC_UNUSED)
+{
+	if (pulse_ready && headphones) {
+		gchar *argv[] = { "/usr/bin/pulseeffects", "--gapplication-service", "-l", "Boosted", NULL };
+		g_autoptr(GError) error = NULL;
+
+		g_spawn_async(NULL, argv, NULL, G_SPAWN_DO_NOT_REAP_CHILD | G_SPAWN_STDOUT_TO_DEV_NULL | G_SPAWN_STDERR_TO_DEV_NULL, child_setup, NULL, &pe_pid, &error);
+		if (!error)
+			g_child_watch_add(pe_pid, child_watch_cb, NULL);
+		else
+			g_error("Spawning child failed: %s", error->message);
+	}
+
+	return G_SOURCE_REMOVE;
+}
+
+static gboolean pulseeffects_stop(gpointer user_data G_GNUC_UNUSED)
+{
+	if (!headphones) {
+		gchar *argv[] = { "/usr/bin/pulseeffects", "-q", NULL };
+		g_spawn_async(NULL, argv, NULL, G_SPAWN_DEFAULT, NULL, NULL, NULL, NULL);
+	}
+
+	return G_SOURCE_REMOVE;
 }
 
 static void deinit_pulse()
@@ -79,11 +107,8 @@ static void cleanup()
 		g_ptr_array_free(number_list, TRUE);
 		number_list = NULL;
 	}
-	g_clear_object(&sess_conn);
 	g_clear_pointer(&loop, g_main_loop_unref);
 }
-
-static void child_setup(gpointer user_data G_GNUC_UNUSED) { setsid(); }
 
 static void pa_sink_info_set_vol_cb(pa_context* context, const pa_sink_info* i, int eol, void* userdata G_GNUC_UNUSED)
 {
@@ -142,9 +167,10 @@ static gboolean x11_event_cb(const XEvent *event, gpointer user_data G_GNUC_UNUS
 		}
 		case UnmapNotify:
 		{
-			XUnmapEvent *uev = (XUnmapEvent *)event;
-			if (number_list->len)
+			if (number_list->len) {
+				XUnmapEvent *uev = (XUnmapEvent *)event;
 				g_ptr_array_remove_fast(number_list, GINT_TO_POINTER(uev->window));
+			}
 			break;
 		}
 		default:
@@ -172,23 +198,16 @@ static void headphones_unplugged(pa_card_info const* card)
 	card_idx = card->index;
 	pa_operation_unref(pa_context_get_sink_info_list(pa_ctx, pa_sink_info_by_card_cb, NULL));
 
-	if (pulseeffects_running()) {
-		gchar *argv[] = { "/usr/bin/pulseeffects", "-q", NULL };
-		g_spawn_async(NULL, argv, NULL, G_SPAWN_DEFAULT, NULL, NULL, NULL, NULL);
-	}
+	if (pe_pid > 1)
+		(void)pulseeffects_stop(NULL);
 }
 
 static void headphones_plugged(pa_card_info const* card G_GNUC_UNUSED)
 {
 	headphones = TRUE;
-	if (!pulseeffects_running()) {
-		gchar *argv[] = { "/usr/bin/pulseeffects", "--gapplication-service", "-l", "Boosted", NULL };
-		g_autoptr(GError) error = NULL;
 
-		g_spawn_async(NULL, argv, NULL, G_SPAWN_STDOUT_TO_DEV_NULL | G_SPAWN_STDERR_TO_DEV_NULL, child_setup, NULL, NULL, &error);
-		if (error)
-		    g_error("Spawning child failed: %s", error->message);
-	}
+	if (pe_pid == 0)
+		(void)pulseeffects_start(NULL);
 
 	if (number_list->len)
 		pa_operation_unref(pa_context_get_server_info(pa_ctx, pa_server_info_callback, NULL));
@@ -270,7 +289,7 @@ static void init_x11()
 
 		Window *win = get_client_list(disp, &nwin);
 		if (win) {
-			for (unsigned long i = 0; i < nwin / sizeof(Window); ++i) {
+			for (typeof(nwin) i = 0; i < nwin / sizeof(Window); ++i) {
 				if (is_mpv_main_window(disp, win[i]))
 					g_ptr_array_add(number_list, GINT_TO_POINTER(win[i]));
 			}
@@ -289,7 +308,6 @@ int main()
 	g_unix_signal_add(SIGTERM, on_sigint, NULL);
 
 	number_list = g_ptr_array_sized_new(2);
-	sess_conn = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, NULL);
 
 	init_x11();
 	init_pulse();
